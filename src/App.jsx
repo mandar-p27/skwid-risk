@@ -647,7 +647,7 @@ function RiskEngine({sim,p,rl}){
 /* ══════════════════════════════════════════════════════════════════════════
    MAIN APP
 ══════════════════════════════════════════════════════════════════════════ */
-const TABS=["Overview","Monte Carlo","Unit Economics","Risk Engine"];
+const TABS=["Overview","Monte Carlo","Unit Economics","Risk Engine","Oracle"];
 
 export default function App(){
   const [tab,setTab]=useState("Overview");
@@ -731,6 +731,7 @@ export default function App(){
               {tab==="Monte Carlo"    && <MonteCarlo sim={sim} p={p}/>}
               {tab==="Unit Economics" && <UnitEcon ue={ue} p={p}/>}
               {tab==="Risk Engine"    && <RiskEngine sim={sim} p={p} rl={rl}/>}
+              {tab==="Oracle"          && <Oracle p={p}/>}
             </>
           )}
 
@@ -753,6 +754,327 @@ export default function App(){
         input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:14px;height:14px;border-radius:50%;background:${B.violetMid};cursor:pointer;border:2px solid ${B.white};}
         @media(min-width:768px){#desktop-sidebar{display:block!important;}}
       `}</style>
+    </div>
+  );
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   SECTION: ORACLE — Scenario Decision Engine
+══════════════════════════════════════════════════════════════════════════ */
+function Oracle({p}) {
+  const [reserve,    setReserve]    = useState(10000);
+  const [accounts,   setAccounts]   = useState(100);
+  const [simPay,     setSimPay]     = useState(3);
+  const [horizon,    setHorizon]    = useState(90);
+  const [running,    setRunning]    = useState(false);
+  const [result,     setResult]     = useState(null);
+
+  /* ── Run scenario ── */
+  const analyze = useCallback(() => {
+    setRunning(true);
+    setTimeout(() => {
+      const N = 10000;
+      const passRate   = p.passRate;
+      const payoutProb = p.payoutProb;
+      const avgPay     = p.avgPay;
+      const payStd     = p.payStd;
+      const corr       = p.corr;
+      const split      = p.split;
+      const floor      = reserve * p.emer;
+      const priceNet   = (p.p5k * (1 - p.aff - p.pmnt)); // assume 5k only for oracle
+      const opDay      = p.opDay;
+
+      // How many of the sold accounts will become funded?
+      const expectedFunded = Math.round(accounts * passRate);
+
+      // Simultaneous payout stress: what if simPay traders all pay at once?
+      // Run distribution of that scenario
+      let ruinCount = 0;
+      let totalPayouts = [];
+      let reserveAfter = [];
+
+      for (let s = 0; s < N; s++) {
+        // Each of the simPay simultaneous traders draws a payout
+        let totalPay = 0;
+        const sCorr = Math.max(0, Math.min(0.95, corr + rNorm(0, 0.08)));
+        for (let t = 0; t < simPay; t++) {
+          const shock = Math.random() < sCorr ? Math.max(0.5, rNorm(1.6, 0.35)) : 1;
+          totalPay += Math.max(30, rLogN(avgPay, payStd) * shock * split);
+        }
+        totalPayouts.push(totalPay);
+        const res = reserve - totalPay;
+        reserveAfter.push(res);
+        if (res < floor) ruinCount++;
+      }
+
+      totalPayouts.sort((a, b) => a - b);
+      reserveAfter.sort((a, b) => a - b);
+
+      const pRuin     = ruinCount / N;
+      const medPay    = totalPayouts[Math.floor(N * 0.5)];
+      const p95Pay    = totalPayouts[Math.floor(N * 0.95)];
+      const p99Pay    = totalPayouts[Math.floor(N * 0.99)];
+      const worstPay  = totalPayouts[N - 1];
+      const medRes    = reserveAfter[Math.floor(N * 0.5)];
+      const p5Res     = reserveAfter[Math.floor(N * 0.05)];
+      const maxDD     = (reserve - p5Res) / reserve;
+
+      // How many simultaneous payouts can we safely absorb?
+      let safeSimultaneous = 0;
+      for (let n = 1; n <= 50; n++) {
+        // Rough: at p99 of log-normal × n × split × correlation shock
+        const p99Single = Math.exp(
+          Math.log(avgPay * avgPay / Math.sqrt(payStd * payStd + avgPay * avgPay)) +
+          2.33 * Math.sqrt(Math.log(1 + (payStd / avgPay) ** 2))
+        ) * 1.6 * split;
+        if (n * p99Single < (reserve - floor) * 0.9) safeSimultaneous = n;
+        else break;
+      }
+
+      // Reserve needed for current funded base at safe level
+      const reserveNeeded = expectedFunded * payoutProb * avgPay * split * 2.8;
+
+      // How many more 5k accounts should be sold before next pause?
+      const revenuePerSale = priceNet - (passRate * payoutProb * avgPay * split);
+      const reserveGap     = Math.max(0, reserveNeeded - reserve);
+      const salesToTarget  = revenuePerSale > 0 ? Math.ceil(reserveGap / revenuePerSale) : 999;
+
+      // Time to reach safe reserve at current sales pace
+      const dailyContrib = p.salesDay * revenuePerSale - opDay;
+      const daysToSafe   = dailyContrib > 0 ? Math.ceil(reserveGap / dailyContrib) : 999;
+
+      // Verdict
+      let verdict, verdictColor, actions;
+      if (pRuin > 0.10) {
+        verdict = "STOP — Critical Reserve Risk";
+        verdictColor = B.red;
+        actions = [
+          `Do not fund any new traders until reserve exceeds ${fdF(reserveNeeded)}.`,
+          `${simPay} simultaneous payouts have a ${fp(pRuin)} chance of breaching emergency floor.`,
+          `Pause challenge sales above current funded count.`,
+          `Rebuild reserve to at least ${fdF(reserveNeeded)} before resuming.`,
+        ];
+      } else if (pRuin > 0.02) {
+        verdict = "CAUTION — Elevated Risk";
+        verdictColor = B.gold;
+        actions = [
+          `Reserve is under pressure. Limit simultaneous funded traders to ${safeSimultaneous}.`,
+          `Sell ${salesToTarget} more 5k challenges to reach safe reserve (${fdF(reserveNeeded)}).`,
+          `At ${p.salesDay} sales/day this takes ~${daysToSafe} days.`,
+          `Do not launch 10k+ accounts until reserve doubles.`,
+        ];
+      } else {
+        verdict = "SAFE — Proceed with Caution";
+        verdictColor = B.green;
+        actions = [
+          `Current reserve can absorb ${safeSimultaneous} simultaneous payouts at 99th percentile.`,
+          `${accounts} accounts sold → ~${expectedFunded} expected funded traders.`,
+          reserveNeeded > reserve
+            ? `Sell ${salesToTarget} more challenges to fully cover expected liability (${fdF(reserveNeeded)}).`
+            : `Reserve already covers expected liability. Growth budget available: ${fdF(reserve - reserveNeeded)}.`,
+          `Next review trigger: when funded trader count exceeds ${Math.round(safeSimultaneous * 3)}.`,
+        ];
+      }
+
+      // Histogram of total payout scenarios
+      const hMin = 0, hMax = worstPay, hBw = (hMax - hMin) / 28;
+      const hist = Array(28).fill(0);
+      totalPayouts.forEach(v => {
+        const i = Math.min(27, Math.floor((v - hMin) / hBw));
+        hist[i]++;
+      });
+
+      setResult({
+        pRuin, medPay, p95Pay, p99Pay, worstPay, medRes, p5Res, maxDD,
+        safeSimultaneous, reserveNeeded, salesToTarget, daysToSafe,
+        expectedFunded, revenuePerSale, dailyContrib, reserveGap,
+        verdict, verdictColor, actions, hist, hMin, hBw,
+      });
+      setRunning(false);
+    }, 60);
+  }, [reserve, accounts, simPay, horizon, p]);
+
+  const SInput = ({ label, value, onChange, min, max, step, fmt, note }) => (
+    <div style={{ marginBottom: 16 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 4 }}>
+        <span style={{ fontSize: 12, color: B.muted }}>{label}</span>
+        <span style={{ fontSize: 12, color: B.violetMid, fontFamily: B.mono, fontWeight: 700 }}>{fmt ? fmt(value) : value}</span>
+      </div>
+      <input type="range" min={min} max={max} step={step} value={value}
+        onChange={e => onChange(Number(e.target.value))}
+        style={{ width: "100%", accentColor: B.violetMid, height: 3 }} />
+      {note && <div style={{ fontSize: 10, color: B.faint, marginTop: 3 }}>{note}</div>}
+    </div>
+  );
+
+  return (
+    <div>
+      <ExplainBox title="What the Oracle does">
+        The Oracle is a forward-looking scenario engine. You give it your current state — actual reserve on hand,
+        number of challenges sold, and a stress scenario (how many traders request payout simultaneously) — and it
+        runs 10,000 simulations of that exact situation. It then tells you: what is your ruin probability right now,
+        what is the maximum drawdown you should expect, how many simultaneous payouts you can safely absorb, and
+        what your single most important next action is. This is the decision layer — not a report of what happened,
+        but a recommendation for what to do next.
+      </ExplainBox>
+
+      {/* Input panel */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(260px,1fr))", gap: 14, marginBottom: 20 }}>
+        <div style={{ background: B.violetDim, border: `1px solid ${B.border}`, borderRadius: 8, padding: "22px" }}>
+          <div style={{ fontSize: 10, color: B.muted, fontFamily: B.mono, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 16 }}>
+            Current Situation
+          </div>
+          <SInput label="Reserve on hand right now" value={reserve} onChange={setReserve} min={1000} max={100000} step={500} fmt={fdF}
+            note="Your actual USDC reserve, not target reserve" />
+          <SInput label="5k challenges sold" value={accounts} onChange={setAccounts} min={1} max={1000} step={1} fmt={v => `${v} accounts`}
+            note={`→ ~${Math.round(accounts * p.passRate)} expected funded traders at ${fp(p.passRate)} pass rate`} />
+          <SInput label="Simultaneous payout stress" value={simPay} onChange={setSimPay} min={1} max={30} step={1} fmt={v => `${v} traders`}
+            note="How many traders could request payout at the same time?" />
+          <SInput label="Time horizon" value={horizon} onChange={setHorizon} min={30} max={365} step={30} fmt={v => `${v} days`} />
+          <button onClick={analyze} disabled={running} style={{
+            width: "100%", marginTop: 8,
+            background: running ? "transparent" : B.violetMid,
+            border: `1px solid ${running ? B.border : B.violetMid}`,
+            borderRadius: 6, color: running ? B.muted : B.white,
+            padding: "12px", fontSize: 12, fontWeight: 700,
+            cursor: running ? "not-allowed" : "pointer",
+            fontFamily: B.mono, letterSpacing: "0.06em",
+          }}>
+            {running ? "ANALYSING…" : "ANALYSE SCENARIO"}
+          </button>
+        </div>
+
+        {/* Live preview even before run */}
+        <div style={{ background: B.violetDim, border: `1px solid ${B.border}`, borderRadius: 8, padding: "22px" }}>
+          <div style={{ fontSize: 10, color: B.muted, fontFamily: B.mono, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 16 }}>
+            Scenario Preview
+          </div>
+          {[
+            ["Challenges sold",        `${accounts} × $${p.p5k}`,                                       B.offWhite],
+            ["Gross revenue",          fdF(accounts * p.p5k),                                            B.green],
+            ["Net revenue (after costs)", fdF(accounts * p.p5k * (1 - p.aff - p.pmnt)),                B.green],
+            ["Expected funded traders", `${Math.round(accounts * p.passRate)} traders`,                  B.offWhite],
+            ["Expected payout liability", fdF(Math.round(accounts * p.passRate) * p.payoutProb * p.avgPay * p.split), B.gold],
+            ["Reserve after liability", fdF(reserve - Math.round(accounts * p.passRate) * p.payoutProb * p.avgPay * p.split), reserve - Math.round(accounts * p.passRate) * p.payoutProb * p.avgPay * p.split > 0 ? B.green : B.red],
+            ["Stress reserve needed",  fdF(Math.round(accounts * p.passRate) * p.payoutProb * p.avgPay * p.split * 2.8), B.red],
+            ["Reserve gap",            fdF(Math.max(0, Math.round(accounts * p.passRate) * p.payoutProb * p.avgPay * p.split * 2.8 - reserve)), B.gold],
+          ].map(([k, v, c]) => (
+            <div key={k} style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline", padding: "8px 0", borderBottom: `1px solid ${B.border}` }}>
+              <span style={{ fontSize: 11, color: B.muted }}>{k}</span>
+              <span style={{ fontSize: 12, color: c, fontFamily: B.mono, fontWeight: 600 }}>{v}</span>
+            </div>
+          ))}
+          <Formula>
+            {`exp_funded = ${accounts} × ${fp(p.passRate)} = ${Math.round(accounts * p.passRate)}\n`}
+            {`exp_liability = ${Math.round(accounts * p.passRate)} × ${fp(p.payoutProb)} × $${p.avgPay} × ${fp(p.split,0)} = ${fdF(Math.round(accounts * p.passRate) * p.payoutProb * p.avgPay * p.split)}\n`}
+            {`stress_liability = exp_liability × 2.8 = ${fdF(Math.round(accounts * p.passRate) * p.payoutProb * p.avgPay * p.split * 2.8)}`}
+          </Formula>
+        </div>
+      </div>
+
+      {/* Results */}
+      {result && (
+        <div>
+          {/* Verdict banner */}
+          <div style={{
+            background: result.verdictColor + "15",
+            border: `2px solid ${result.verdictColor}`,
+            borderRadius: 8, padding: "20px 24px", marginBottom: 20,
+          }}>
+            <div style={{ fontSize: 10, color: result.verdictColor, fontFamily: B.mono, letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 6 }}>
+              Oracle Verdict
+            </div>
+            <div style={{ fontSize: 22, fontWeight: 800, color: result.verdictColor, fontFamily: B.mono, marginBottom: 14 }}>
+              {result.verdict}
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {result.actions.map((a, i) => (
+                <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
+                  <div style={{ width: 20, height: 20, borderRadius: "50%", background: result.verdictColor + "33", border: `1px solid ${result.verdictColor}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0, marginTop: 1 }}>
+                    <span style={{ fontSize: 10, color: result.verdictColor, fontWeight: 700 }}>{i + 1}</span>
+                  </div>
+                  <span style={{ fontSize: 13, color: B.offWhite, lineHeight: 1.6 }}>{a}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Key numbers */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))", gap: 10, marginBottom: 16 }}>
+            {[
+              ["Ruin Probability",       fp(result.pRuin, 2),       result.pRuin > 0.05 ? B.red : result.pRuin > 0.01 ? B.gold : B.green],
+              ["Max Drawdown (p95)",     fp(result.maxDD),           result.maxDD > 0.5 ? B.red : B.gold],
+              ["Median Total Payout",    fdF(result.medPay),         B.gold],
+              ["99th Pct Payout",        fdF(result.p99Pay),         B.red],
+              ["Reserve After (median)", fdF(result.medRes),         result.medRes > 0 ? B.green : B.red],
+              ["Safe Simultaneous",      `${result.safeSimultaneous} traders`, B.green],
+              ["Reserve Needed",         fdF(result.reserveNeeded),  B.gold],
+              ["Sales to Cover Gap",     result.salesToTarget < 999 ? `${result.salesToTarget} sales` : "∞", B.offWhite],
+              ["Days to Safe Reserve",   result.daysToSafe < 999 ? `${result.daysToSafe} days` : "∞", B.offWhite],
+              ["Expected Funded",        `${result.expectedFunded} traders`, B.offWhite],
+            ].map(([k, v, c]) => (
+              <div key={k} style={{ background: B.faint, border: `1px solid ${B.border}`, borderRadius: 6, padding: "12px 14px" }}>
+                <div style={{ fontSize: 10, color: B.muted, textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 6 }}>{k}</div>
+                <div style={{ fontSize: 15, fontWeight: 700, color: c, fontFamily: B.mono }}>{v}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Payout distribution histogram */}
+          <div style={{ background: B.violetDim, border: `1px solid ${B.border}`, borderRadius: 8, padding: "20px", marginBottom: 16 }}>
+            <div style={{ fontSize: 10, color: B.muted, fontFamily: B.mono, letterSpacing: "0.08em", textTransform: "uppercase", marginBottom: 4 }}>
+              Total Payout Distribution — {simPay} Simultaneous Traders
+            </div>
+            <div style={{ fontSize: 11, color: B.muted, marginBottom: 14 }}>
+              10,000 simulations of {simPay} traders all paying out at once. How much reserve do you lose?
+            </div>
+            <svg width="100%" viewBox="0 0 560 80" preserveAspectRatio="none" style={{ display: "block", height: 80 }}>
+              {result.hist.map((count, i) => {
+                const max = Math.max(...result.hist);
+                const bH = (count / max) * 72;
+                const mid = result.hMin + (i + 0.5) * result.hBw;
+                const col = mid > reserve ? B.red : mid > reserve * 0.5 ? B.gold : B.green;
+                return <rect key={i} x={i * (560 / 28) + 1} y={80 - bH} width={560 / 28 - 2} height={bH} fill={col} opacity={0.8} rx={1} />;
+              })}
+              {/* Reserve line */}
+              <line
+                x1={(reserve / (result.hMin + 28 * result.hBw)) * 560}
+                y1={0}
+                x2={(reserve / (result.hMin + 28 * result.hBw)) * 560}
+                y2={80}
+                stroke={B.red} strokeWidth={2} strokeDasharray="4,3"
+              />
+            </svg>
+            <div style={{ display: "flex", justifyContent: "space-between", marginTop: 6 }}>
+              <span style={{ fontSize: 10, color: B.muted, fontFamily: B.mono }}>{fdF(result.hMin)} (best case)</span>
+              <span style={{ fontSize: 10, color: B.red, fontFamily: B.mono }}>← reserve floor</span>
+              <span style={{ fontSize: 10, color: B.muted, fontFamily: B.mono }}>{fdF(result.hMin + 28 * result.hBw)} (worst case)</span>
+            </div>
+          </div>
+
+          {/* Calculation transparency */}
+          <ExplainBox title="How the Oracle calculated this">
+            For each of 10,000 simulation runs: sampled {simPay} simultaneous trader payouts from Log-Normal(μ=${p.avgPay}, σ=${p.payStd}),
+            applied correlation shock (p={fp(p.corr,0)} chance of ×1.6 multiplier per trader), multiplied by profit split ({fp(p.split,0)}),
+            summed total payout, subtracted from reserve ({fdF(reserve)}), checked if result fell below emergency floor ({fdF(reserve * p.emer)}).
+            Ruin = fraction of runs where reserve &lt; floor. Safe simultaneous = max N where p99 total payout &lt; 90% of available reserve.
+          </ExplainBox>
+          <Formula>
+            {`payout[trader] = LogNormal(μ=$${p.avgPay}, σ=$${p.payStd}) × correlation_shock × ${fp(p.split,0)}\n`}
+            {`total_payout = Σ payout[1..${simPay}]\n`}
+            {`reserve_after = $${reserve.toLocaleString()} − total_payout\n`}
+            {`ruin = reserve_after < $${Math.round(reserve * p.emer).toLocaleString()} (${fp(p.emer,0)} floor)\n`}
+            {`P(ruin) = ${fp(result.pRuin, 2)} across 10,000 runs`}
+          </Formula>
+        </div>
+      )}
+
+      {!result && (
+        <div style={{ background: B.violetDim, border: `1px solid ${B.border}`, borderRadius: 8, padding: "40px", textAlign: "center" }}>
+          <div style={{ fontSize: 14, color: B.muted, fontFamily: B.mono, marginBottom: 8 }}>Set your scenario above and hit Analyse</div>
+          <div style={{ fontSize: 12, color: B.faint }}>The Oracle will tell you exactly what to do next.</div>
+        </div>
+      )}
     </div>
   );
 }
